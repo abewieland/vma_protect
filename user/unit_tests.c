@@ -1,4 +1,5 @@
-#define _GNU_SOURCE /* for mremap */
+/* for mremap (though also helps with mkstemp and ftruncate) */
+#define _GNU_SOURCE
 #include "vma_protect.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,13 +13,19 @@
 #include <signal.h>
 #include <pthread.h>
 
-#define PAGESIZE 0x1000
-
-volatile int segv_code;
-sigjmp_buf segv_buf;
-
 extern uint8_t _init[];
 extern uint8_t __etext[];
+char* seg_start;
+char* seg_end;
+size_t seg_len;
+
+/* Evaluate their arguments more than once */
+#define min(x, y) ((x) < (y) ? (x) : (y))
+#define max(x, y) ((x) < (y) ? (x) : (y))
+
+/* Handle segfaults */
+volatile int segv_code;
+sigjmp_buf segv_buf;
 
 void segv_handler(int sig, siginfo_t* info, void* ucontext) {
     (void) sig, (void) ucontext;
@@ -41,11 +48,18 @@ const char* segv_code_str(int code) {
     }
 }
 
+#define fpr_id(f, fmt, ...) \
+    fprintf(f, "pid %d tid %d: " fmt, getpid(), gettid(), ##__VA_ARGS__)
+
+#define perr_id(str) fpr_id(stderr, str ": %m\n")
+
+#define pr_id(...) fpr_id(stdout, __VA_ARGS__)
+
 #define segv_guard \
     do { \
         if (sigsetjmp(segv_buf, 1)) { \
-            fprintf(stderr, "Segfault caught at %s:%d; reason: %s\n", \
-                    __FILE__, __LINE__ + 1, segv_code_str(segv_code)); \
+            fpr_id(stderr, "Segfault caught at %s:%d with reason: %s\n", \
+                   __FILE__, __LINE__ + 1, segv_code_str(segv_code)); \
             return -1; \
         } \
     } while (0)
@@ -57,16 +71,16 @@ int write_helper(void* dst) {
     return 0;
 }
 
-int __vma_prot write_secret(void* prot) {
-    int r = vma_open("write_vma", prot);
+int _label_safe write_secret(void* prot) {
+    int r = vma_open(prot, "write_vma");
     if (r < 0) {
-        perror("vma_protect: open");
+        perr_id("vma_protect: open");
     } else {
         r = write_helper(prot);
     }
     /* Very unlikely that vma_close will fail, but catch it anyway */
     if (vma_close(prot) < 0) {
-        perror("vma_protect: close");
+        perr_id("vma_protect: close");
         return -1;
     }
     return r;
@@ -78,15 +92,15 @@ int read_helper(void* dst, void* src) {
     return 0;
 }
 
-int __vma_prot read_secret(void* dst, void* prot) {
-    int r = vma_open("read_vma", prot);
+int _label_safe read_secret(void* dst, void* prot) {
+    int r = vma_open(prot, "read_vma");
     if (r < 0) {
-        perror("vma_protect: open");
+        perr_id("vma_protect: open");
     } else {
         r = read_helper(dst, prot);
     }
     if (vma_close(prot) < 0) {
-        perror("vma_protect: close");
+        perr_id("vma_protect: close");
         return -1;
     }
     return r;
@@ -95,45 +109,45 @@ int __vma_prot read_secret(void* dst, void* prot) {
 /* Just mov %edi, %eax; ret */
 const char asm_code[] = {0x89, 0xf8, 0xc3};
 
-int exec_helper(void* dst) {
+int exec_helper(void* dst, size_t len) {
     segv_guard;
     memcpy(dst, asm_code, sizeof(asm_code));
-    int r = mprotect(dst, PAGESIZE * 4, PROT_READ | PROT_EXEC);
+    int r = mprotect(dst, len, PROT_READ | PROT_EXEC);
     if (r < 0) {
-        perror("mprotect: exec");
+        perr_id("mprotect: exec");
         return r;
     }
     int (*fptr) (int) = dst;
     segv_guard;
     r = fptr(42);
     if (r != 42) {
-        fprintf(stderr, "Expected value 42, got %d\n", r);
+        fpr_id(stderr, "Expected value 42, got %d\n", r);
         return -1;
     }
-    r = mprotect(dst, PAGESIZE * 4, PROT_READ | PROT_WRITE);
-    if (r < 0) perror("mprotect: write");
+    r = mprotect(dst, len, PROT_READ | PROT_WRITE);
+    if (r < 0) perr_id("mprotect: write");
     return r;
 }
 
-int __vma_prot exec_secret(void* prot) {
-    int r = vma_open("exec_vma", prot);
+int _label_safe exec_secret(void* prot, size_t len) {
+    int r = vma_open(prot, "exec_vma");
     if (r < 0) {
-        perror("vma_protect: open");
+        perr_id("vma_protect: open");
     } else {
-        r = exec_helper(prot);
+        r = exec_helper(prot, len);
     }
     if (vma_close(prot) < 0) {
-        perror("vma_protect: close");
+        perr_id("vma_protect: close");
         return -1;
     }
     return r;
 }
 
 /* Switch statements are also certainly possible */
-int __vma_prot dispatch_secret(int action, void* prot, char* buf) {
-    int r = vma_open("dispatch_vma", prot);
+int _label_safe dispatch_secret(int action, void* prot, char* buf, size_t len) {
+    int r = vma_open(prot, "dispatch_vma");
     if (r < 0) {
-        perror("vma_protect: open");
+        perr_id("vma_protect: open");
     } else {
         switch (action) {
             case 0:
@@ -143,337 +157,279 @@ int __vma_prot dispatch_secret(int action, void* prot, char* buf) {
                 r = read_helper(buf, prot);
                 break;
             case 2:
-                r = exec_helper(prot);
+                r = exec_helper(prot, len);
                 break;
             default:
-                fprintf(stderr, "Unknown action %d\n", action);
+                fpr_id(stderr, "Unknown action %d\n", action);
                 r = -1;
                 break;
         }
     }
     if (vma_close(prot) < 0) {
-        perror("vma_protect: close");
+        perr_id("vma_protect: close");
         return -1;
     }
     return r;
 }
 
+/* A useless function for a thread to run */
 void* nothing(void* arg) {
-    printf("Thread %d running...\n", gettid());
+    pr_id("Doing nothing...\n");
     for (size_t i = 0; i < 10000000000UL; ++i) {
-        asm("");
+        asm(""); /* Prevent loop optimizations */
     }
-    printf("Thread %d done\n", gettid());
+    pr_id("Nothing done\n");
     return arg;
 }
 
-int main(void) {
+/* Run a number of tests against a protected mapping */
+int test_mmap(char** prot, char** code, size_t len, int prot_bits, int flags, int fd) {
     char buf[PAGESIZE];
 
-    /*
-     * A bit of a hack, but we know our .text section will end up in the same
-     * segment as .init, which always starts it (for gcc and GNU ld, at least);
-     * __etext need not be a page multiple off of _init, but that doesn't really
-     * matter here anyway
-     */
-    char* seg_start = (void*) &_init;
-    char* seg_end = (void*) &__etext;
-    size_t seg_len = seg_end - seg_start;
-
-    printf("Setting signal handler...\n");
-    struct sigaction s;
-    s.sa_sigaction = segv_handler;
-    sigemptyset(&s.sa_mask);
-    s.sa_flags = SA_SIGINFO;
-    int r = sigaction(SIGSEGV, &s, NULL);
+    *prot = mmap(NULL, len, prot_bits, flags, fd, 0);
+    if (*prot == MAP_FAILED) {
+        perr_id("mmap");
+        return 1;
+    }
+    pr_id("Mapping succeeded at [%p,%p); adding critical regions...\n",
+          *prot, *prot + len);
+    int r = vma_add_addr(*prot, "write_vma");
     if (r < 0) {
-        perror("sigaction");
+        perr_id("vma_protect: add_addr");
         return 1;
     }
-
-    /* Ensure threading works fine */
-    printf("Main thread: %d\n", gettid());
-    pthread_t t;
-    r = pthread_create(&t, NULL, nothing, NULL);
-    if (r) {
-        errno = r;
-        perror("create thread");
+    pr_id("Successfully added critical region for write at %p\n",
+          global_addr("write_vma"));
+    r = vma_add_addr(*prot, "read_vma");
+    if (r < 0) {
+        perr_id("vma_protect: add_addr");
         return 1;
     }
-    r = pthread_join(t, NULL);
-    if (r) {
-        errno = r;
-        perror("join thread");
+    pr_id("Successfully added critical region for read at %p\n",
+          global_addr("read_vma"));
+    r = vma_add_addr(*prot, "exec_vma");
+    if (r < 0) {
+        perr_id("vma_protect: add_addr");
         return 1;
     }
-    printf("Main thread back (%d)\n", gettid());
-
-    /* if MAP_PROTECT is provided, it must be a private anonymous mapping */
-    printf("Attempting shared protected mapping...\n");
-    char* p = mmap(NULL, PAGESIZE, PROT_NONE,
-                   MAP_ANONYMOUS | MAP_SHARED | MAP_PROTECT, -1, 0);
-    if (p == MAP_FAILED) {
-        perror("mmap");
+    pr_id("Successfully added critical region for exec at %p\n",
+          global_addr("exec_vma"));
+    r = vma_add_addr(*prot, "dispatch_vma");
+    if (r < 0) {
+        perr_id("vma_protect: add_addr");
+        return 1;
+    }
+    pr_id("Successfully added critical region for dispatch at %p\n",
+          global_addr("dispatch_vma"));
+    pr_id("Attempting double open...\n");
+    r = vma_open(*prot, "temp1");
+    if (r < 0) {
+        perr_id("vma_protect: open");
     } else {
-        fprintf(stderr, "Expected EINVAL\n");
+        fpr_id(stderr, "Expected EINVAL\n");
         return 1;
     }
-    /* Ensure it's due to MAP_PROTECT */
-    char* q = mmap(NULL, PAGESIZE, PROT_NONE, MAP_ANONYMOUS | MAP_SHARED, -1, 0);
-    if (q == MAP_FAILED) {
-        perror("mmap reference");
-        return 1;
-    }
-    r = munmap(q, PAGESIZE);
+    pr_id("Failed as expected; attempting to add protected region...\n");
+    r = syscall(SYS_vma_protect, *prot, VMA_ADD_ADDR, *prot);
     if (r < 0) {
-        perror("munmap reference");
-        return 1;
-    }
-
-    /* The same, with a file */
-    printf("Failed as expected; attempting file-based mapping...\n");
-    int fd = open("/dev/zero", O_RDONLY);
-    if (fd < 0) {
-        perror("open /dev/zero");
-        return 1;
-    }
-    p = mmap(NULL, PAGESIZE, PROT_READ, MAP_PRIVATE | MAP_PROTECT, fd, 0);
-    if (p == MAP_FAILED) {
-        perror("mmap");
+        perr_id("vma_protect: add_addr");
     } else {
-        fprintf(stderr, "Expected EINVAL\n");
+        fpr_id(stderr, "Expected EINVAL\n");
         return 1;
     }
-    q = mmap(NULL, PAGESIZE, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (q == MAP_FAILED) {
-        perror("mmap reference");
-        return 1;
-    }
-    r = munmap(q, PAGESIZE);
-    if (r < 0) {
-        perror("munmap reference");
-        return 1;
-    }
-    close(fd);
-
-    /* Now, correct setup */
-    printf("Failed as expected; attempting correct mapping...\n");
-    p = mmap(NULL, PAGESIZE * 4, PROT_READ | PROT_WRITE,
-             MAP_ANONYMOUS | MAP_PRIVATE | MAP_PROTECT, -1, 0);
-    if (p == MAP_FAILED) {
-        perror("mmap");
-        return 1;
-    }
-    printf("Four page mapping succeeded, mapped [%p,%p) with RW permissions\n"
-           "Adding critical regions...\n", p, p + 4 * PAGESIZE);
-    r = syscall(SYS_vma_protect, p, VMA_ADD_ADDR, global_addr("write_vma"));
-    if (r < 0) {
-        perror("vma_protect: add_addr");
-        return 1;
-    }
-    printf("Successfully added critical region for write address (%p)\n",
-           global_addr("write_vma"));
-    r = syscall(SYS_vma_protect, p, VMA_ADD_ADDR, global_addr("read_vma"));
-    if (r < 0) {
-        perror("vma_protect: add_addr");
-        return 1;
-    }
-    printf("Successfully added critical region for read address (%p)\n",
-           global_addr("read_vma"));
-    r = syscall(SYS_vma_protect, p, VMA_ADD_ADDR, global_addr("exec_vma"));
-    if (r < 0) {
-        perror("vma_protect: add_addr");
-        return 1;
-    }
-    printf("Successfully added critical region for exec address (%p)\n",
-           global_addr("exec_vma"));
-    r = syscall(SYS_vma_protect, p, VMA_ADD_ADDR, global_addr("dispatch_vma"));
-    if (r < 0) {
-        perror("vma_protect: add_addr");
-        return 1;
-    }
-    printf("Successfully added critical region for dispatch address (%p)\n"
-           "Attempting double open...\n", global_addr("dispatch_vma"));
-    r = vma_open("temp1", p);
-    if (r < 0) {
-        perror("vma_protect: open");
-    } else {
-        fprintf(stderr, "Expected EINVAL\n");
-        return 1;
-    }
-    printf("Failed as expected; attempting to add protected region...\n");
-    r = syscall(SYS_vma_protect, p, VMA_ADD_ADDR, p);
-    if (r < 0) {
-        perror("vma_protect: add_addr");
-    } else {
-        fprintf(stderr, "Expected EINVAL\n");
-        return 1;
-    }
-    printf("Failed as expected; attempting to add writable region...\n");
-    q = mmap(NULL, PAGESIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
-             MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    if (q == MAP_FAILED) {
-        perror("mmap reference");
+    pr_id("Failed as expected; attempting to add writable region...\n");
+    *code = mmap(NULL, PAGESIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
+                 MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (*code == MAP_FAILED) {
+        perr_id("mmap code page");
         return 1;
     }
     /* Fill with hlt; we won't actually execute this page */
-    memset(q, 0xf4, PAGESIZE);
-    r = syscall(SYS_vma_protect, p, VMA_ADD_ADDR, q);
+    memset(*code, 0xf4, PAGESIZE);
+    r = syscall(SYS_vma_protect, *prot, VMA_ADD_ADDR, *code);
     if (r < 0) {
-        perror("vma_protect: add_addr");
+        perr_id("vma_protect: add_addr");
     } else {
-        fprintf(stderr, "Expected EINVAL\n");
+        fpr_id(stderr, "Expected EINVAL\n");
         return 1;
     }
-    printf("Failed as expected; adding as second valid code mapping...\n");
-    r = mprotect(q, PAGESIZE, PROT_READ | PROT_EXEC);
+    pr_id("Failed as expected; adding as second valid code mapping...\n");
+    r = mprotect(*code, PAGESIZE, PROT_READ | PROT_EXEC);
     if (r < 0) {
-        perror("mprotect: exec");
+        perr_id("mprotect: exec");
         return 1;
     }
-    r = syscall(SYS_vma_protect, p, VMA_ADD_ADDR, q);
+    r = syscall(SYS_vma_protect, *prot, VMA_ADD_ADDR, *code);
     if (r < 0) {
-        perror("vma_protect: add_addr");
+        perr_id("vma_protect: add_addr");
         return 1;
     }
-    printf("Succeeded; attempting seal...\n");
-    r = vma_close(p);
+    pr_id("Succeeded; attempting mlock...\n");
+    r = mlock(*prot, len);
     if (r < 0) {
-        perror("vma_protect: close");
+        perr_id("mlock");
+        return 1;
+    }
+    r = munlock(*prot, len);
+    if (r < 0) {
+        perr_id("munlock");
+        return 1;
+    }
+    pr_id("Succeeded; attempting seal...\n");
+    r = vma_close(*prot);
+    if (r < 0) {
+        perr_id("vma_protect: close");
+        return 1;
+    }
+
+    /* mlock should fail if closed */
+    pr_id("Succeeded; attempting mlock...\n");
+    r = mlock(*prot, len);
+    if (r < 0) {
+        perr_id("mlock");
+    } else {
+        fpr_id(stderr, "Expected ENOMEM\n");
+        return 1;
+    }
+    /* But munlock will succeed, because they weren't locked in the first place */
+    pr_id("Failed as expected; attempting munlock...\n");
+    r = munlock(*prot, len);
+    if (r < 0) {
+        perr_id("munlock");
         return 1;
     }
 
     /* Read, write, and execute in the region, with and without opening it */
-    printf("Successfully sealed protected region; attempting write...\n");
-    r = write_secret(p);
+    pr_id("Succeeded; attempting write...\n");
+    r = write_secret(*prot);
     if (r < 0) return 1;
-    printf("Write successful; attempting read...\n");
-    r = read_secret(buf, p);
+    pr_id("Write successful; attempting read...\n");
+    r = read_secret(buf, *prot);
     if (r < 0) return 1;
-    printf("Read successful (got '%s'); attempting exec...\n", buf);
-    r = exec_secret(p);
+    pr_id("Read successful (got '%s'); attempting exec...\n", buf);
+    r = exec_secret(*prot, len);
     if (r < 0) return 1;
-    printf("Exec successful; attempting same via dispatch...\n");
-    r = dispatch_secret(0, p, buf);
+    pr_id("Exec successful; attempting same via dispatch...\n");
+    r = dispatch_secret(0, *prot, buf, len);
     if (r < 0) return 1;
-    r = dispatch_secret(1, p, buf);
+    r = dispatch_secret(1, *prot, buf, len);
     if (r < 0) return 1;
-    r = dispatch_secret(2, p, buf);
+    r = dispatch_secret(2, *prot, buf, len);
     if (r < 0) return 1;
-    printf("Dispatches successful (got '%s' for read); attempting failed write...\n", buf);
-    r = write_helper(p);
+    pr_id("Dispatches successful (got '%s' for read); attempting failed write...\n", buf);
+    r = write_helper(*prot);
     if (!r) {
-        fprintf(stderr, "Expected segfault\n");
+        fpr_id(stderr, "Expected segfault\n");
         return 1;
     }
-    printf("Failed as expected; attempting failed read...\n");
-    r = read_helper(p, buf);
+    pr_id("Failed as expected; attempting failed read...\n");
+    r = read_helper(buf, *prot);
     if (!r) {
-        fprintf(stderr, "Expected segfault\n");
+        fpr_id(stderr, "Expected segfault\n");
         return 1;
     }
-    printf("Failed as expected; attempting failed exec...\n");
-    r = exec_helper(p);
+    pr_id("Failed as expected; attempting failed exec...\n");
+    r = exec_helper(*prot, len);
     if (!r) {
-        fprintf(stderr, "Expected segfault\n");
+        fpr_id(stderr, "Expected segfault\n");
         return 1;
     }
 
     /* mprotect */
-    printf("Failed as expected; attempting various failed mprotects...\n");
-    r = mprotect(p, 4 * PAGESIZE, PROT_READ | PROT_WRITE);
+    pr_id("Failed as expected; attempting various failed mprotects...\n");
+    r = mprotect(*prot, len, PROT_READ | PROT_WRITE);
     if (r < 0) {
-        perror("mprotect: read/write");
+        perr_id("mprotect: read/write");
     } else {
-        fprintf(stderr, "Expected EACCESS\n");
+        fpr_id(stderr, "Expected EACCESS\n");
         return 1;
     }
-    r = mprotect(p, PAGESIZE, PROT_WRITE);
+    r = mprotect(*prot, PAGESIZE, PROT_WRITE);
     if (r < 0) {
-        perror("mprotect: start write");
+        perr_id("mprotect: start write");
     } else {
-        fprintf(stderr, "Expected EACCESS\n");
+        fpr_id(stderr, "Expected EACCESS\n");
         return 1;
     }
-    r = mprotect(p + PAGESIZE, PAGESIZE * 3, PROT_READ);
+    r = mprotect(*prot + PAGESIZE, len - PAGESIZE, PROT_READ);
     if (r < 0) {
-        perror("mprotect: offset read");
+        perr_id("mprotect: offset read");
     } else {
-        fprintf(stderr, "Expected EACCESS\n");
+        fpr_id(stderr, "Expected EACCESS\n");
         return 1;
     }
     /* We can't make the critical regions writable, but the rest is fine */
     r = mprotect(seg_start, seg_len, PROT_WRITE | PROT_EXEC);
     if (r < 0) {
-        perror("mprotect: code write/exec");
+        perr_id("mprotect: code write/exec");
     } else {
-        fprintf(stderr, "Expected EACCESS\n");
+        fpr_id(stderr, "Expected EACCESS\n");
         return 1;
     }
     r = mprotect(seg_start, seg_len, PROT_EXEC);
     if (r < 0) {
-        perror("mprotect: reference");
+        perr_id("mprotect: reference");
         return 1;
     }
     r = mprotect(seg_start, seg_len, PROT_READ | PROT_EXEC);
     if (r < 0) {
-        perror("mprotect: reference");
+        perr_id("mprotect: reference");
         return 1;
     }
-    r = mprotect(q, PAGESIZE, PROT_WRITE);
+    r = mprotect(*code, PAGESIZE, PROT_WRITE);
     if (r < 0) {
-        perror("mprotect: code write");
+        perr_id("mprotect: code write");
     } else {
-        fprintf(stderr, "Expected EACCESS\n");
+        fpr_id(stderr, "Expected EACCESS\n");
         return 1;
     }
-    r = mprotect(q, PAGESIZE, PROT_NONE);
+    r = mprotect(*code, PAGESIZE, PROT_NONE);
     if (r < 0) {
-        perror("mprotect: reference");
+        perr_id("mprotect: reference");
         return 1;
     }
-    r = mprotect(q, PAGESIZE, PROT_READ | PROT_EXEC);
+    r = mprotect(*code, PAGESIZE, PROT_READ | PROT_EXEC);
     if (r < 0) {
-        perror("mprotect: reference");
+        perr_id("mprotect: reference");
         return 1;
     }
 
     /* Obviously we can't write to them directly, either */
-    printf("All failed as expected; attempting to write to code locations...\n");
+    pr_id("All failed as expected; attempting to write to code locations...\n");
     r = write_helper(seg_start);
     if (!r) {
-        fprintf(stderr, "Expected segfault\n");
+        fpr_id(stderr, "Expected segfault\n");
         return 1;
     }
-    r = write_helper(q);
+    r = write_helper(*code);
     if (!r) {
-        fprintf(stderr, "Expected segfault\n");
+        fpr_id(stderr, "Expected segfault\n");
         return 1;
     }
 
     /* Nothing is valid when closed except open from the correct location */
-    printf("Failed as expected; attempting to open in a random location...\n");
-    r = vma_open("temp2", p);
+    pr_id("Failed as expected; attempting to open in a random location...\n");
+    r = vma_open(*prot, "temp2");
     if (r < 0) {
-        perror("vma_protect: open");
+        perr_id("vma_protect: open");
     } else {
-        fprintf(stderr, "Expected EFAULT\n");
+        fpr_id(stderr, "Expected EFAULT\n");
         return 1;
     }
-    printf("Failed as expected; attempting to double close...\n");
-    r = vma_close(p);
+    pr_id("Failed as expected; attempting to double close...\n");
+    r = vma_close(*prot);
     if (r < 0) {
-        perror("vma_protect: close");
+        perr_id("vma_protect: close");
     } else {
-        fprintf(stderr, "Expected EINVAL\n");
+        fpr_id(stderr, "Expected EINVAL\n");
         return 1;
     }
-    printf("Failed as expected; attempting to add address...\n");
-    r = syscall(SYS_vma_protect, p, VMA_ADD_ADDR, NULL);
+    pr_id("Failed as expected; attempting to add address...\n");
+    r = vma_add_addr(*prot, "temp2");
     if (r < 0) {
-        perror("vma_protect: add_addr");
+        perr_id("vma_protect: add_addr");
     } else {
-        fprintf(stderr, "Expected EINVAL\n");
+        fpr_id(stderr, "Expected EINVAL\n");
         return 1;
     }
 
@@ -481,143 +437,241 @@ int main(void) {
      * unmapping: only unmapping the protected region is valid, not any part of
      * it, nor its code regions
      */
-    printf("Failed as expected; attempting to unmap part of region...\n");
-    r = munmap(p, PAGESIZE);
+    pr_id("Failed as expected; attempting to unmap part of region...\n");
+    r = munmap(*prot, PAGESIZE);
     if (r < 0) {
-        perror("munmap");
+        perr_id("munmap");
     } else {
-        fprintf(stderr, "Expected EINVAL\n");
+        fpr_id(stderr, "Expected EINVAL\n");
         return 1;
     }
-    printf("Failed as expected; attempting to unmap part of code region...\n");
+    pr_id("Failed as expected; attempting to unmap part of code region...\n");
     r = munmap(seg_start, PAGESIZE);
     if (r < 0) {
-        perror("munmap");
+        perr_id("munmap");
     } else {
-        fprintf(stderr, "Expected EINVAL\n");
+        fpr_id(stderr, "Expected EINVAL\n");
         return 1;
     }
-    printf("Failed as expected; attempting to unmap entire code region...\n");
-    r = munmap(q, PAGESIZE);
+    pr_id("Failed as expected; attempting to unmap entire code region...\n");
+    r = munmap(*code, PAGESIZE);
     if (r < 0) {
-        perror("munmap");
+        perr_id("munmap");
     } else {
-        fprintf(stderr, "Expected EINVAL\n");
-        return 1;
-    }
-
-    /* mlock is fine (just a nop) */
-    printf("Failed as expected; attempting to mlock...\n");
-    r = mlock(p, PAGESIZE);
-    if (r < 0) {
-        perror("mlock");
-        return 1;
-    }
-    r = mlock(p, 4 * PAGESIZE);
-    if (r < 0) {
-        perror("mlock");
+        fpr_id(stderr, "Expected EINVAL\n");
         return 1;
     }
 
     /* remap: basically never allowed */
-    printf("Succeeded; attempting to remap protected region...\n");
-    char* rp = mremap(p, 4 * PAGESIZE, 8 * PAGESIZE, MREMAP_MAYMOVE);
+    pr_id("Failed as expected; attempting to remap protected region (grow)...\n");
+    char* rp = mremap(*prot, len, len * 2, MREMAP_MAYMOVE);
     if (rp == MAP_FAILED) {
-        perror("mremap");
+        perr_id("mremap");
     } else {
-        fprintf(stderr, "Expected EINVAL\n");
+        fpr_id(stderr, "Expected EINVAL\n");
         return 1;
     }
-    printf("Failed as expected; attempting with different flags...\n");
-    rp = mremap(p, 4 * PAGESIZE, 2 * PAGESIZE, MREMAP_FIXED | MREMAP_MAYMOVE,
-                p + PAGESIZE);
+    pr_id("Failed as expected; attempting to move...\n");
+    rp = mremap(*prot, len, len, MREMAP_FIXED | MREMAP_MAYMOVE, *prot + PAGESIZE);
     if (rp == MAP_FAILED) {
-        perror("mremap");
+        perr_id("mremap");
     } else {
-        fprintf(stderr, "Expected EINVAL\n");
+        fpr_id(stderr, "Expected EINVAL\n");
         return 1;
     }
-    printf("Failed as expected; attempting to shrink...\n");
-    rp = mremap(p, 4 * PAGESIZE, 2 * PAGESIZE, 0);
+    pr_id("Failed as expected; attempting to shrink...\n");
+    rp = mremap(*prot, len, len, 0);
     if (rp == MAP_FAILED) {
-        perror("mremap");
+        perr_id("mremap");
     } else {
-        fprintf(stderr, "Expected EINVAL\n");
+        fpr_id(stderr, "Expected EINVAL\n");
         return 1;
     }
-    printf("Failed as expected; attempting to remap code regions...\n");
-    rp = mremap(seg_start, PAGESIZE, 4 * PAGESIZE, MREMAP_MAYMOVE);
+    pr_id("Failed as expected; attempting to remap code regions...\n");
+    rp = mremap(*code, PAGESIZE, 4 * PAGESIZE, MREMAP_MAYMOVE);
     if (rp == MAP_FAILED) {
-        perror("mremap");
+        perr_id("mremap");
     } else {
-        fprintf(stderr, "Expected EINVAL\n");
+        fpr_id(stderr, "Expected EINVAL\n");
+        return 1;
+    }
+    rp = mremap(seg_start, seg_len, 2 * seg_len, MREMAP_MAYMOVE);
+    if (rp == MAP_FAILED) {
+        perr_id("mremap");
+    } else {
+        fpr_id(stderr, "Expected EINVAL\n");
+        return 1;
+    }
+    pr_id("Failed as expected\n");
+    return 0;
+}
+
+int main(void) {
+    /*
+     * A bit of a hack, but we know our .text section will end up in the same
+     * segment as _init, which always starts it (for gcc and GNU ld, at least);
+     * __etext need not be a page multiple off of _init, but that doesn't really
+     * matter here anyway
+     */
+    seg_start = (void*) &_init;
+    seg_end = (void*) &__etext;
+    seg_len = seg_end - seg_start;
+
+    pr_id("Setting signal handler...\n");
+    struct sigaction s;
+    s.sa_sigaction = segv_handler;
+    sigemptyset(&s.sa_mask);
+    s.sa_flags = SA_SIGINFO;
+    int r = sigaction(SIGSEGV, &s, NULL);
+    if (r < 0) {
+        perr_id("sigaction");
         return 1;
     }
 
-    /* No new threads while a protected region is active */
-    printf("Failed as expected; attempting to spawn threads...\n");
+    /* Ensure threading works fine */
+    pthread_t t;
     r = pthread_create(&t, NULL, nothing, NULL);
     if (r) {
         errno = r;
-        perror("create thread");
+        perr_id("create thread");
+        return 1;
+    }
+    r = pthread_join(t, NULL);
+    if (r) {
+        errno = r;
+        perr_id("join thread");
+        return 1;
+    }
+    pr_id("Thread done\n");
+
+    char *prot1, *prot2, *code1, *code2;
+    pr_id("Attempting 4-page anonymous private mapping...\n");
+    r = test_mmap(&prot1, &code1, 4 * PAGESIZE, PROT_READ | PROT_WRITE,
+                  MAP_ANONYMOUS | MAP_PRIVATE | MAP_PROTECT, -1);
+    if (r) return 1;
+
+    /* No new threads while a protected region is active */
+    pr_id("Attempting to spawn threads...\n");
+    r = pthread_create(&t, NULL, nothing, NULL);
+    if (r) {
+        errno = r;
+        perr_id("create thread");
     } else {
-        fprintf(stderr, "Expected EINVAL\n");
+        fpr_id(stderr, "Expected EINVAL\n");
         return 1;
     }
 
     /* No forks, either */
-    printf("Failed as expected; attempting to fork...\n");
+    pr_id("Failed as expected; attempting to fork...\n");
     pid_t pid = fork();
     if (pid < 0) {
-        perror("fork");
+        perr_id("fork");
     } else if (pid) {
-        fprintf(stderr, "Expected EINVAL\n");
+        fpr_id(stderr, "Expected EINVAL\n");
+        return 1;
+    } else {
+        return 1;
+    }
+    pr_id("Failed as expected\n");
+
+    pr_id("Attempting 8-page file-backed mapping...\n");
+    char tmpname[14] = "vma_tmpXXXXXX";
+    int fd = mkstemp(tmpname);
+    if (fd < 0) {
+        perr_id("mkstemp");
+        return 1;
+    }
+    r = ftruncate(fd, 8 * PAGESIZE);
+    if (r < 0) {
+        perr_id("ftruncate");
+        return 1;
+    }
+    r = test_mmap(&prot2, &code2, 8 * PAGESIZE, PROT_READ | PROT_WRITE,
+                  MAP_SHARED | MAP_PROTECT, fd);
+    if (r) return 1;
+    r = close(fd);
+    if (r < 0) {
+        perr_id("close");
+        return 1;
+    }
+    r = unlink(tmpname);
+    if (r < 0) {
+        perr_id("unlink");
+        return 1;
+    }
+
+    /* Again, no threads or forks */
+    pr_id("Attempting to spawn threads...\n");
+    r = pthread_create(&t, NULL, nothing, NULL);
+    if (r) {
+        errno = r;
+        perr_id("create thread");
+    } else {
+        fpr_id(stderr, "Expected EINVAL\n");
+        return 1;
+    }
+    pr_id("Failed as expected; attempting to fork...\n");
+    pid = fork();
+    if (pid < 0) {
+        perr_id("fork");
+    } else if (pid) {
+        fpr_id(stderr, "Expected EINVAL\n");
         return 1;
     } else {
         return 1;
     }
 
     /* Unmap */
-    printf("Failed as expected; cleaning up...\n");
-    r = munmap(p, 4 * PAGESIZE);
+    pr_id("Failed as expected; cleaning up...\n");
+    r = munmap(prot1, 4 * PAGESIZE);
     if (r < 0) {
-        perror("munmap");
+        perr_id("munmap");
         return 1;
     }
-    r = munmap(q, PAGESIZE);
+    r = munmap(prot2, 8 * PAGESIZE);
     if (r < 0) {
-        perror("munmap");
+        perr_id("munmap");
+        return 1;
+    }
+    r = munmap(code1, PAGESIZE);
+    if (r < 0) {
+        perr_id("munmap");
+        return 1;
+    }
+    r = munmap(code2, PAGESIZE);
+    if (r < 0) {
+        perr_id("munmap");
         return 1;
     }
 
     /* Now threads and forking should be back on the table! */
-    printf("Unmaps succeeded; creating thread...\n");
+    pr_id("Unmaps succeeded; creating thread...\n");
     r = pthread_create(&t, NULL, nothing, NULL);
     if (r) {
         errno = r;
-        perror("create thread");
+        perr_id("create thread");
         return 1;
     }
     r = pthread_join(t, NULL);
     if (r) {
         errno = r;
-        perror("join thread");
+        perr_id("join thread");
         return 1;
     }
-    printf("Thread succeeded; forking (child should segfault)...\n");
+    pr_id("Thread succeeded; forking (child should segfault)...\n");
     pid = fork();
     if (pid < 0) {
-        perror("fork");
+        perr_id("fork");
         return 1;
     } else if (!pid) {
-        r = write_helper(p);
+        r = write_helper(prot1);
         if (!r) {
-            fprintf(stderr, "Expected segfault (missing area)\n");
+            fpr_id(stderr, "Expected segfault (missing area)\n");
         }
         _exit(0);
     }
     waitpid(pid, NULL, 0);
 
-    printf("All complete!\n");
+    pr_id("All complete!\n");
     return 0;
 }
