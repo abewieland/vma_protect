@@ -1,6 +1,26 @@
 CFLAGS = -Wall -Wextra -O2 -g $(CPPFLAGS)
 CXXFLAGS = $(CFLAGS) -std=c++11
 PROGS = check_critical unit_tests passwd passwd-static
+NDEBUG_FILE = .ndebug_opt
+
+# Rebuild libcrypt when NDEBUG changes
+
+ifneq ($(wildcard $(NDEBUG_FILE)),)
+include $(NDEBUG_FILE)
+endif
+
+NDEBUG ?= 1
+
+ifneq ($(NDEBUG),$(OLD_NDEBUG))
+OLD_NDEBUG := $(shell echo "OLD_NDEBUG := $(NDEBUG)" > $(NDEBUG_FILE))
+endif
+
+ifeq ($(NDEBUG),1)
+CPPFLAGS += -DNDEBUG
+NDEBUG_OPT := CPPFLAGS=-DNDEBUG
+else
+NDEBUG_OPT :=
+endif
 
 all: $(PROGS)
 
@@ -10,20 +30,20 @@ check_critical: check_critical.cc
 unit_tests: unit_tests.c
 	gcc $(CFLAGS) -pthread $^ -o $@
 
-passwd: passwd.c
+passwd: passwd.c pass.c pass.h
 	gcc $(CFLAGS) -DCRYPT_DYN_CALL $^ -lcrypt -o $@
 
-passwd-static: passwd.c libcrypt/.libs/libcrypt.a
+passwd-static: passwd.c pass.c pass.h libcrypt/.libs/libcrypt.a
 	musl-gcc $(CFLAGS) -Ilibcrypt -static $^ -o $@
 
-libcrypt/.libs/libcrypt.a:
+libcrypt/.libs/libcrypt.a: $(NDEBUG_FILE)
 	sed -i 's/#undef NDEBUG//' libcrypt/lib/crypt-port.h
-	sh -c "cd libcrypt && ./autogen.sh"
-	sh -c "cd libcrypt && ./configure CC=musl-gcc CPPFLAGS=-DNDEBUG"
+	sh -c "cd libcrypt; [ -x configure ] || ./autogen.sh"
+	sh -c "cd libcrypt; ./configure CC=musl-gcc $(NDEBUG_OPT)"
 	make -C libcrypt
 
 clean:
-	rm -rf $(PROGS)
+	rm -f $(PROGS) $(NDEBUG_FILE)
 
 distclean: clean
 	git -C libcrypt restore lib/crypt-port.h

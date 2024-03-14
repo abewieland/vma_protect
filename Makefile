@@ -21,6 +21,9 @@ $(DEBIANDIR):
 	sudo ln -s ../asm-generic $@/usr/include/x86_64-linux-musl/
 	sudo ln -s ../linux $@/usr/include/x86_64-linux-musl/
 	sudo ln -s ../x86_64-linux-gnu/asm $@/usr/include/x86_64-linux-musl/
+	sudo useradd -R $$(realpath $@) tom
+	sudo useradd -R $$(realpath $@) dick
+	sudo useradd -R $$(realpath $@) harry
 
 update-img: img $(DEBIANDIR) $(USERDIR)
 	mkdir -p $(MOUNTDIR)

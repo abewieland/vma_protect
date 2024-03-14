@@ -45,7 +45,12 @@
     })
 
 #ifdef VMA_PROT_DISABLE
-#define MAP_PROTECT     0
+
+#define MAP_PROTECT                 0
+#define vma_open(addr, name)        0
+#define vma_close(addr)             0
+#define vma_add_addr(addr, name)    0
+
 #else
 
 #define MAP_PROTECT     0x400000
