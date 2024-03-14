@@ -1,3 +1,6 @@
 [submodule "linux"]
 	path = linux
 	url = git@github.com:abewieland/linux-vma_protect
+[submodule "libcrypt"]
+	path = user/libcrypt
+	url = git@github.com:besser82/libxcrypt.git

@@ -19,10 +19,6 @@ char* seg_start;
 char* seg_end;
 size_t seg_len;
 
-/* Evaluate their arguments more than once */
-#define min(x, y) ((x) < (y) ? (x) : (y))
-#define max(x, y) ((x) < (y) ? (x) : (y))
-
 /* Handle segfaults */
 volatile int segv_code;
 sigjmp_buf segv_buf;

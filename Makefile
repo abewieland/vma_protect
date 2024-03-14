@@ -15,8 +15,12 @@ $(DEBIANDIR):
 	sudo debootstrap $(DEBIANVER) $@ http://deb.debian.org/debian/
 	sudo sed -i 's/^root:x:/root::/' $@/etc/passwd
 	sudo chroot $@ /bin/sh -c \
-		"apt-get update && apt-get install -y make g++ \
-		 musl-tools gdb libcapstone-dev libelf-dev libcrypt-dev"
+		"apt-get update && apt-get install -y build-essential \
+		 musl-tools gdb libcapstone-dev libelf-dev libcrypt-dev \
+		 debhelper pkg-config"
+	sudo ln -s ../asm-generic $@/usr/include/x86_64-linux-musl/
+	sudo ln -s ../linux $@/usr/include/x86_64-linux-musl/
+	sudo ln -s ../x86_64-linux-gnu/asm $@/usr/include/x86_64-linux-musl/
 
 update-img: img $(DEBIANDIR) $(USERDIR)
 	mkdir -p $(MOUNTDIR)
