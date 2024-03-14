@@ -3,6 +3,8 @@ CXXFLAGS = $(CFLAGS) -std=c++11
 PROGS = check_critical unit_tests passwd passwd-static
 NDEBUG_FILE = .ndebug_opt
 
+include users.mk
+
 # Rebuild libcrypt when NDEBUG changes
 
 ifneq ($(wildcard $(NDEBUG_FILE)),)
@@ -42,11 +44,14 @@ libcrypt/.libs/libcrypt.a: $(NDEBUG_FILE)
 	sh -c "cd libcrypt; ./configure CC=musl-gcc $(NDEBUG_OPT)"
 	make -C libcrypt
 
+reset-pass:
+	for u in $(USERS); do echo "$$u:$$u"; done | chpasswd
+
 clean:
 	rm -f $(PROGS) $(NDEBUG_FILE)
 
 distclean: clean
 	git -C libcrypt restore lib/crypt-port.h
-	make -C libcrypt distclean
+	make -C libcrypt distclean || true
 
-.PHONY: clean distclean
+.PHONY: all clean distclean reset-pass

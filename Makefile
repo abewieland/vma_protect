@@ -9,6 +9,8 @@ ifeq ($(STOP),1)
 QEMUSTOP = -S
 endif
 
+include user/users.mk
+
 all: update-img kernel
 
 $(DEBIANDIR):
@@ -21,9 +23,7 @@ $(DEBIANDIR):
 	sudo ln -s ../asm-generic $@/usr/include/x86_64-linux-musl/
 	sudo ln -s ../linux $@/usr/include/x86_64-linux-musl/
 	sudo ln -s ../x86_64-linux-gnu/asm $@/usr/include/x86_64-linux-musl/
-	sudo useradd -R $$(realpath $@) tom
-	sudo useradd -R $$(realpath $@) dick
-	sudo useradd -R $$(realpath $@) harry
+	for u in $(USERS); do sudo useradd -R $$(realpath $@) $$u; done
 
 update-img: img $(DEBIANDIR) $(USERDIR)
 	mkdir -p $(MOUNTDIR)
@@ -54,4 +54,4 @@ distclean: clean
 	rmdir $(MOUNTDIR)
 	sudo rm -r $(DEBIANDIR)
 
-.PHONY: clean distclean run update-img kernel
+.PHONY: all clean distclean run update-img kernel

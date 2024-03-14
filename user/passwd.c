@@ -9,8 +9,6 @@
 #include <stdlib.h>
 #include <errno.h>
 
-#define SHADOW "foo"
-#define PASSWD "/etc/passwd"
 #include "pass.h"
 
 /*
