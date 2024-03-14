@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -5,6 +6,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 
 #include "pass.h"
 
@@ -187,7 +189,7 @@ int _label_safe pass_change(struct pass_data* d, const char* name,
                 errno = EINVAL;
                 goto out;
             }
-            strcpy(s, d->d->output);
+            memcpy(s, d->d->output, strlen(d->d->output));
 
             explicit_bzero(d->d, sizeof *d->d);
             r = 0;
@@ -203,4 +205,80 @@ int _label_safe pass_change(struct pass_data* d, const char* name,
 out:
     vma_close(d->p);
     return r;
+}
+
+const char* get_passwd(size_t* sz) {
+    int fd = open(PASSWD, O_RDONLY);
+    if (fd < 0) return NULL;
+    struct stat s;
+    int r = fstat(fd, &s);
+    if (r < 0) {
+        close(fd);
+        return NULL;
+    }
+    if (!S_ISREG(s.st_mode)) {
+        close(fd);
+        errno = EINVAL;
+        return NULL;
+    }
+    /* Same hack as above */
+    const char* p = mmap(NULL, s.st_size + 1, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED) return NULL;
+    *sz = s.st_size + 1;
+    return p;
+}
+
+int put_passwd(const char* file, size_t sz) {
+    return munmap((char*) file, sz);
+}
+
+uid_t name_to_uid(const char* file, const char* name) {
+    size_t nlen = strlen(name);
+    for (const char* colon = strchr(file, ':'); colon; colon = strchr(file, ':')) {
+        if ((size_t) (colon - file) == nlen && !(strncmp(file, name, nlen))) {
+            file = strchr(colon + 1, ':') + 1;
+            return strtoul(file, NULL, 10);
+        }
+        file = strchr(file, '\n');
+        if (!file) break;
+        ++file;
+    }
+    return 0;
+}
+
+char* uid_to_name(const char* file, uid_t uid) {
+    for (const char* colon = strchr(file, ':'); colon; colon = strchr(file, ':')) {
+        const char* us = strchr(colon + 1, ':') + 1;
+        if (strtoul(us, NULL, 10) == uid) {
+            size_t len = colon - file;
+            char* ret = malloc(len + 1);
+            memcpy(ret, file, len);
+            ret[len] = 0;
+            return ret;
+        }
+        file = strchr(file, '\n');
+        if (!file) break;
+        ++file;
+    }
+    return NULL;
+}
+
+int drop_priv(void) {
+    size_t sz;
+    const char* passwd = get_passwd(&sz);
+    if (!passwd) return -1;
+
+    uid_t nobody = name_to_uid(passwd, "nobody");
+    if (!nobody) {
+        if (put_passwd(passwd, sz) < 0) return -1;
+        errno = ENOENT;
+        return -1;
+    }
+
+    if (put_passwd(passwd, sz) < 0) return -1;
+    if (setresgid(nobody, nobody, nobody) < 0) return -1;
+    if (setresuid(nobody, nobody, nobody) < 0) return -1;
+
+    return 0;
 }

@@ -1,54 +1,45 @@
-#define _GNU_SOURCE
-#include "vma_protect.h"
-
-#include <sys/stat.h>
+#define _GNU_SOURCE /* for setresuid, setresgid */
+#include <unistd.h>
+#include <termios.h>
 #include <fcntl.h>
 
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
-#include <errno.h>
+#include <string.h>
 
 #include "pass.h"
 
-/*
- * Assuming file is a null-terminated well-formed string representation
- * of /etc/passwd, returns the UID associated with name if found,
- * 0 otherwise (root also returns 0 if found, but is always UID 0).
- */
-uid_t name_to_uid(const char* file, const char* name) {
-    size_t nlen = strlen(name);
-    for (const char* colon = strchr(file, ':'); colon; colon = strchr(file, ':')) {
-        if ((size_t) (colon - file) == nlen && !(strncmp(file, name, nlen))) {
-            file = strchr(colon + 1, ':') + 1;
-            return strtoul(file, NULL, 10);
-        }
-        file = strchr(file, '\n');
-        if (!file) break;
-        ++file;
+/* Read a password from stdin, hiding the characters */
+int read_pass(const char* prompt, char* buf, size_t len) {
+    struct termios t;
+    int fd = open("/dev/tty", O_RDWR);
+    if (fd < 0) return -1;
+    int r = tcgetattr(fd, &t);
+    if (r < 0) goto close;
+    t.c_lflag &= ~ECHO;
+    r = tcsetattr(fd, TCSANOW, &t);
+    if (r < 0) goto close;
+    printf("%s", prompt);
+    fflush(stdout);
+    fgets(buf, len, stdin);
+    size_t plen = strlen(buf);
+    t.c_lflag |= ECHO;
+    r = tcsetattr(fd, TCSANOW, &t);
+    if (r < 0) goto close;
+    close(fd);
+    printf("\n");
+    if (buf[plen - 1] == '\n') {
+        buf[plen - 1] = 0;
+    } else {
+        printf("Warning: maximum password length exceeded; truncating...\n");
     }
     return 0;
-}
 
-/*
- * Go the other direction, returning a null-terminated string allocated by
- * malloc if uid was found, NULL otherwise
- */
-char* uid_to_name(const char* file, uid_t uid) {
-    for (const char* colon = strchr(file, ':'); colon; colon = strchr(file, ':')) {
-        const char* us = strchr(colon + 1, ':') + 1;
-        if (strtoul(us, NULL, 10) == uid) {
-            size_t len = colon - file;
-            char* ret = malloc(len + 1);
-            memcpy(ret, file, len);
-            ret[len] = 0;
-            return ret;
-        }
-        file = strchr(file, '\n');
-        if (!file) break;
-        ++file;
-    }
-    return NULL;
+close:
+    r = errno;
+    close(fd);
+    errno = r;
+    return -1;
 }
 
 /*
@@ -64,109 +55,94 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    int fd = open(PASSWD, O_RDONLY);
-    if (fd < 0) {
-        fprintf(stderr, "open " PASSWD ": %m\n");
+    size_t sz;
+    const char* passwd = get_passwd(&sz);
+    if (!passwd) {
+        fprintf(stderr, PASSWD ": cannot open or map: %m\n");
         return 2;
     }
-    struct stat s;
-    int r = fstat(fd, &s);
-    if (r < 0) {
-        fprintf(stderr, "stat " PASSWD ": %m\n");
-        return 2;
-    }
-    if (!S_ISREG(s.st_mode)) {
-        fprintf(stderr, PASSWD ": expected normal file\n");
-        return 2;
-    }
-    char* passwd = mmap(NULL, s.st_size + 1, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (passwd == MAP_FAILED) {
-        fprintf(stderr, "mmap " PASSWD ": %m\n");
-        return 2;
-    }
-    close(fd);
 
     uid_t nobody = name_to_uid(passwd, "nobody");
     if (!nobody) {
-        fprintf(stderr, PASSWD ": couldn't find nobody user\n");
+        fprintf(stderr, PASSWD ": cannot find nobody user\n");
         return 2;
     }
 
     char* user = uid_to_name(passwd, getuid());
     if (!user) {
-        fprintf(stderr, PASSWD ": couldn't find current user\n");
+        fprintf(stderr, PASSWD ": cannot find current user\n");
         return 2;
     }
-    r = munmap(passwd, s.st_size + 1);
+    int r = put_passwd(passwd, sz);
     if (r < 0) {
-        fprintf(stderr, "munmap " PASSWD ": %m\n");
+        fprintf(stderr, PASSWD ": cannot unmap: %m\n");
         return 2;
     }
 
     struct pass_data* d = pass_init();
     if (!d) {
-        fprintf(stderr, "cannot initialize pass api: %m\n");
+        fprintf(stderr, "Cannot initialize pass api: %m\n");
         return 2;
     }
 
     r = setresgid(nobody, nobody, nobody);
     if (r < 0) {
-        fprintf(stderr, "cannot set GID: %m\n");
+        fprintf(stderr, "Cannot set GID: %m\n");
         return 2;
     }
     r = setresuid(nobody, nobody, nobody);
     if (r < 0) {
-        fprintf(stderr, "cannot set UID: %m\n");
+        fprintf(stderr, "Cannot set UID: %m\n");
         return 2;
     }
 
-    printf("Checking john with \"john\"...\n");
-    r = pass_check(d, "john", "john");
+    char oldp[CRYPT_MAX_PASSPHRASE_SIZE];
+    char newp[CRYPT_MAX_PASSPHRASE_SIZE];
+    char newp2[CRYPT_MAX_PASSPHRASE_SIZE];
+
+    printf("Changing password for %s.\n", user);
+    r = read_pass("Current password: ", oldp, sizeof oldp);
     if (r < 0) {
-        fprintf(stderr, "error checking password: %m\n");
+        fprintf(stderr, "Cannot read password: %m\n");
         return 2;
-    } else if (!r) {
-        printf("invalid password\n");
-    } else {
-        printf("valid password\n");
     }
 
-    printf("Checking john with \"abe\"...\n");
-    r = pass_check(d, "john", "abe");
+    r = pass_check(d, user, oldp);
     if (r < 0) {
-        fprintf(stderr, "error checking password: %m\n");
+        fprintf(stderr, "Cannot verify password: %m\n");
         return 2;
     } else if (!r) {
-        printf("invalid password\n");
-    } else {
-        printf("valid password\n");
+        fprintf(stderr, "Incorrect password\n");
+        return 1;
     }
 
-    printf("Checking bad user \"blah\"...\n");
-    r = pass_check(d, "blah", "blah");
+    r = read_pass("New password: ", newp, sizeof newp);
     if (r < 0) {
-        fprintf(stderr, "error checking password: %m\n");
+        fprintf(stderr, "Cannot read password: %m\n");
         return 2;
-    } else if (!r) {
-        printf("invalid password\n");
-    } else {
-        printf("valid password\n");
+    }
+    r = read_pass("Retype new password: ", newp2, sizeof newp2);
+    if (r < 0) {
+        fprintf(stderr, "Cannot read password: %m\n");
+        return 2;
     }
 
-    printf("Checking root user (password locked)...\n");
-    r = pass_check(d, "root", "root");
-    if (r < 0) {
-        fprintf(stderr, "error checking password: %m\n");
-        return 2;
-    } else if (!r) {
-        printf("invalid password\n");
-    } else {
-        printf("valid password\n");
+    if (strcmp(newp, newp2)) {
+        fprintf(stderr, "Passwords do not match\n");
+        return 1;
     }
+
+    r = pass_change(d, user, oldp, newp);
+    if (r < 0) {
+        fprintf(stderr, "Cannot change password: %m\n");
+        return 2;
+    }
+
+    printf("Password changed successfully\n");
 
     r = pass_fini(d);
     if (r < 0) {
-        fprintf(stderr, "could not finish pass api: %m\n");
+        fprintf(stderr, "Cannot finish pass api: %m\n");
         return 2;
     }
 

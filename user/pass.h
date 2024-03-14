@@ -51,4 +51,42 @@ int _label_safe pass_check(struct pass_data* d, const char* name,
 int _label_safe pass_change(struct pass_data* d, const char* name,
                             const char* oldpass, const char* newpass);
 
+/*
+ * These next four functions are just for convenience; they don't don't use
+ * vma_protect at all (since /etc/passwd is generally readable by all anyway)
+ */
+
+/*
+ * Opens /etc/passwd for reading, as a convenience function; the string returned
+ * is NULL-terminated and should be passed to put_passwd(), along with the set
+ * sz; returns NULL on error, setting errno
+ */
+const char* get_passwd(size_t* sz);
+
+/*
+ * Clean up resources from get_passwd; returns 0 on success, -1 on failure
+ * (setting errno as appropriate)
+ */
+int put_passwd(const char* file, size_t sz);
+
+/*
+ * With file as returned from get_passwd, return the UID associated with name
+ * if found, 0 otherwise (root also returns 0 if found, but is always UID 0)
+ */
+uid_t name_to_uid(const char* file, const char* name);
+
+/*
+ * With file as returned from get_passwd, return a NULL-terminated string
+ * (allocated with malloc) representing user UID if found, NULL otherwise;
+ * if non-null, the caller should free the string after use
+ */
+char* uid_to_name(const char* file, uid_t uid);
+
+/*
+ * Finally, one more - if the user has no interest in looking up UIDs in
+ * /etc/passwd, the following drops priveleges (by switching to user nobody);
+ * returns 0 on success, -1 on failure with errno set
+ */
+int drop_priv(void);
+
 #endif /* PASS_H */
