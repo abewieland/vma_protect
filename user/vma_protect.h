@@ -44,23 +44,24 @@
       __addr; \
     })
 
+enum vma_protect_cmd {
+    VMA_ADD_ADDR = 0,
+    VMA_OPEN,
+    VMA_CLOSE
+};
+
 #ifdef VMA_PROT_DISABLE
 
 #define MAP_PROTECT                 0
 #define vma_open(addr, name)        0
 #define vma_close(addr)             0
 #define vma_add_addr(addr, name)    0
+#define SYS_vma_protect             (-1)
 
 #else
 
 #define MAP_PROTECT     0x400000
 #define SYS_vma_protect 451
-
-enum vma_protect_cmd {
-    VMA_ADD_ADDR = 0,
-    VMA_OPEN,
-    VMA_CLOSE
-};
 
 /*
  * vma_close could be implemented by calling the libc syscall function, but to

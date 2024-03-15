@@ -1,0 +1,7 @@
+check_critical
+passtests
+passwd
+passbench
+unit_tests
+.build
+.cpp_opt
