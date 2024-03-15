@@ -41,7 +41,7 @@ kernel:
 	cp -u $(LINUXDIR)/arch/x86/boot/bzImage kernel
 
 run: update-img kernel
-	qemu-system-x86_64 -M q35 -smp 4 -m 2G -accel kvm \
+	qemu-system-x86_64 -M q35 -smp 4 -m 8G -accel kvm \
 	-kernel kernel -append "nokaslr console=ttyS0 root=/dev/sda rw" \
 	-drive file=img,media=disk,format=raw,index=0 \
 	-nographic -s $(QEMUSTOP)

@@ -29,6 +29,14 @@ void segv_handler(int sig, siginfo_t* info, void* ucontext) {
     siglongjmp(segv_buf, 1);
 }
 
+/* And our own signals */
+volatile int usr1_received;
+
+void usr1_handler(int sig) {
+    (void) sig;
+    usr1_received = 1;
+}
+
 const char* segv_code_str(int code) {
     switch(code) {
         case SEGV_MAPERR:
@@ -68,7 +76,7 @@ int write_helper(void* dst) {
 }
 
 int _label_safe write_secret(void* prot) {
-    int r = vma_open(prot, "write_vma");
+    int r = vma_open(prot, "write");
     if (r < 0) {
         perr_id("vma_protect: open");
     } else {
@@ -89,7 +97,7 @@ int read_helper(void* dst, void* src) {
 }
 
 int _label_safe read_secret(void* dst, void* prot) {
-    int r = vma_open(prot, "read_vma");
+    int r = vma_open(prot, "read");
     if (r < 0) {
         perr_id("vma_protect: open");
     } else {
@@ -126,7 +134,7 @@ int exec_helper(void* dst, size_t len) {
 }
 
 int _label_safe exec_secret(void* prot, size_t len) {
-    int r = vma_open(prot, "exec_vma");
+    int r = vma_open(prot, "exec");
     if (r < 0) {
         perr_id("vma_protect: open");
     } else {
@@ -141,7 +149,7 @@ int _label_safe exec_secret(void* prot, size_t len) {
 
 /* Switch statements are also certainly possible */
 int _label_safe dispatch_secret(int action, void* prot, char* buf, size_t len) {
-    int r = vma_open(prot, "dispatch_vma");
+    int r = vma_open(prot, "dispatch");
     if (r < 0) {
         perr_id("vma_protect: open");
     } else {
@@ -159,6 +167,30 @@ int _label_safe dispatch_secret(int action, void* prot, char* buf, size_t len) {
                 fpr_id(stderr, "Unknown action %d\n", action);
                 r = -1;
                 break;
+        }
+    }
+    if (vma_close(prot) < 0) {
+        perr_id("vma_protect: close");
+        return -1;
+    }
+    return r;
+}
+
+int get_signal(void) {
+    usr1_received = 0;
+    raise(SIGUSR1);
+    return usr1_received;
+}
+
+int _label_safe test_signal(void* prot) {
+    int r = vma_open(prot, "signal");
+    if (r < 0) {
+        perr_id("vma_protect: open");
+    } else {
+        r = 0;
+        if (get_signal()) {
+            r = -1;
+            fpr_id(stderr, "Received signal in critical region\n");
         }
     }
     if (vma_close(prot) < 0) {
@@ -189,34 +221,41 @@ int test_mmap(char** prot, char** code, size_t len, int prot_bits, int flags, in
     }
     pr_id("Mapping succeeded at [%p,%p); adding critical regions...\n",
           *prot, *prot + len);
-    int r = vma_add_addr(*prot, "write_vma");
+    int r = vma_add_addr(*prot, "write");
     if (r < 0) {
         perr_id("vma_protect: add_addr");
         return 1;
     }
     pr_id("Successfully added critical region for write at %p\n",
-          global_addr("write_vma"));
-    r = vma_add_addr(*prot, "read_vma");
+          global_addr("write"));
+    r = vma_add_addr(*prot, "read");
     if (r < 0) {
         perr_id("vma_protect: add_addr");
         return 1;
     }
     pr_id("Successfully added critical region for read at %p\n",
-          global_addr("read_vma"));
-    r = vma_add_addr(*prot, "exec_vma");
+          global_addr("read"));
+    r = vma_add_addr(*prot, "exec");
     if (r < 0) {
         perr_id("vma_protect: add_addr");
         return 1;
     }
     pr_id("Successfully added critical region for exec at %p\n",
-          global_addr("exec_vma"));
-    r = vma_add_addr(*prot, "dispatch_vma");
+          global_addr("exec"));
+    r = vma_add_addr(*prot, "dispatch");
     if (r < 0) {
         perr_id("vma_protect: add_addr");
         return 1;
     }
     pr_id("Successfully added critical region for dispatch at %p\n",
-          global_addr("dispatch_vma"));
+          global_addr("dispatch"));
+    r = vma_add_addr(*prot, "signal");
+    if (r < 0) {
+        perr_id("vma_protect: add_addr");
+        return 1;
+    }
+    pr_id("Successfully added critical region for signal at %p\n",
+          global_addr("signal"));
     pr_id("Attempting double open...\n");
     r = vma_open(*prot, "temp1");
     if (r < 0) {
@@ -312,7 +351,10 @@ int test_mmap(char** prot, char** code, size_t len, int prot_bits, int flags, in
     if (r < 0) return 1;
     r = dispatch_secret(2, *prot, buf, len);
     if (r < 0) return 1;
-    pr_id("Dispatches successful (got '%s' for read); attempting failed write...\n", buf);
+    pr_id("Dispatches successful (got '%s' for read); attempting signal...\n", buf);
+    r = test_signal(*prot);
+    if (r < 0) return 1;
+    pr_id("Signal masking succeeded; attempting failed write...\n");
     r = write_helper(*prot);
     if (!r) {
         fpr_id(stderr, "Expected segfault\n");
@@ -513,18 +555,33 @@ int main(void) {
     seg_end = (void*) &__etext;
     seg_len = seg_end - seg_start;
 
-    pr_id("Setting signal handler...\n");
+    pr_id("Setting signal handlers...\n");
     struct sigaction s;
-    s.sa_sigaction = segv_handler;
     sigemptyset(&s.sa_mask);
     s.sa_flags = SA_SIGINFO;
+    s.sa_sigaction = segv_handler;
     int r = sigaction(SIGSEGV, &s, NULL);
     if (r < 0) {
-        perr_id("sigaction");
+        perr_id("sigaction: segv");
+        return 1;
+    }
+    s.sa_flags = 0;
+    s.sa_handler = usr1_handler;
+    r = sigaction(SIGUSR1, &s, NULL);
+    if (r < 0) {
+        perr_id("sigaction: usr1");
+        return 1;
+    }
+
+    /* Ensure we can get SIGUSR1 */
+    pr_id("Checking if we can receive signal...\n");
+    if (!get_signal()) {
+        fpr_id(stderr, "Couldn't catch SIGUSR1\n");
         return 1;
     }
 
     /* Ensure threading works fine */
+    pr_id("Attempting to spawn threads...\n");
     pthread_t t;
     r = pthread_create(&t, NULL, nothing, NULL);
     if (r) {

@@ -1,6 +1,6 @@
 PASS_PROGS = passtests passwd passbench
 PASS_PROGS_S = $(patsubst %,%-static,$(PASS_PROGS))
-VMA_PROGS = unit_tests $(PASS_PROGS) $(PASS_PROGS_S)
+VMA_PROGS = unit_tests $(PASS_PROGS) $(PASS_PROGS_S) aggregate aggregate-static
 PROGS = check_critical $(VMA_PROGS)
 CFLAGS = -Wall -Wextra -O2 -g
 CXXFLAGS = $(CFLAGS) -std=c++11
@@ -38,6 +38,12 @@ check_critical: check_critical.cc
 $(VMA_PROGS): vma_protect.h $(BUILDSTAMP)
 unit_tests: unit_tests.c
 	gcc $(CFLAGS) $(CPPFLAGS) -pthread $^ -o $@
+
+aggregate: aggregate.c
+	gcc $(CFLAGS) $(CPPFLAGS) $^ -lm -o $@
+
+aggregate-static: aggregate.c
+	musl-gcc $(CFLAGS) $(CPPFLAGS) -static $^ -lm -o $@
 
 $(PASS_PROGS): pass.h
 $(PASS_PROGS): %: %.c pass.c

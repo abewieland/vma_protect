@@ -52,10 +52,12 @@ enum vma_protect_cmd {
 
 #ifdef VMA_PROT_DISABLE
 
+inline int ret_zero(void) { return 0; }
+
 #define MAP_PROTECT                 0
-#define vma_open(addr, name)        0
-#define vma_close(addr)             0
-#define vma_add_addr(addr, name)    0
+#define vma_open(addr, name)        ret_zero()
+#define vma_close(addr)             ret_zero()
+#define vma_add_addr(addr, name)    ret_zero()
 #define SYS_vma_protect             (-1)
 
 #else
